@@ -1,0 +1,435 @@
+================================================================================
+  EXPLICACAO DETALHADA DAS MODIFICACOES — K-MEANS PARALELO
+  Referencia: codigo base fornecido pelo professor (k_means_clustering.c)
+================================================================================
+
+
+================================================================================
+SECAO 1 — CODIGO BASE -> kmeans_seq.c (versao sequencial adaptada)
+================================================================================
+
+MODIFICACAO 1 — Substituicao do gerador de dados por leitura de CSV real
+-------------------------------------------------------------------------
+BASE: a funcao test() gerava pontos aleatorios em circulo com rand() e cos/sin.
+
+SEQUENCIAL: removido e substituido pela funcao loadCSV():
+
+    size_t loadCSV(const char *filename, observation *observations, size_t maxPoints) {
+        FILE *fp = fopen(filename, "r");
+        char line[128];
+        fgets(line, sizeof(line), fp); // pula cabecalho
+        while (count < maxPoints && fgets(line, sizeof(line), fp)) {
+            double lon, lat;
+            if (sscanf(line, "%lf,%lf", &lon, &lat) == 2)
+                if (lon != 0.0 && lat != 0.0) { ... }
+        }
+    }
+
+POR QUE: o enunciado exige base de dados real com tempo sequencial minimo de
+10 segundos. Dados aleatorios em circulo nao atendem isso. O dataset NYC Taxi
+tem ~10 milhoes de pontos reais de GPS de corridas de taxi em Nova York, o que
+garante tempo de execucao suficiente para benchmark significativo.
+
+
+MODIFICACAO 2 — Medicao de tempo com clock_gettime
+---------------------------------------------------
+BASE: sem nenhuma medicao de tempo.
+
+SEQUENCIAL:
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    cluster *clusters = kMeans(observations, size, k);
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double elapsed = (t_end.tv_sec - t_start.tv_sec) +
+                     (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+
+POR QUE: CLOCK_MONOTONIC mede tempo de parede real (wall time), nao afetado
+por ajustes do sistema. E a forma correta de medir tempo de execucao em
+benchmarks. A funcao time() tem resolucao de apenas 1 segundo, o que e
+impreciso demais para comparar versoes paralelas.
+
+
+MODIFICACAO 3 — Semente fixa e remocao do printEPS
+---------------------------------------------------
+BASE: srand(time(NULL)) usava semente aleatoria. printEPS imprimia resultado
+como imagem EPS.
+
+SEQUENCIAL: srand(42) — semente fixa. printEPS removido.
+
+POR QUE: semente fixa garante reprodutibilidade — todas as versoes (seq, OMP,
+CUDA) partem da mesma inicializacao aleatoria dos grupos, permitindo comparar
+resultados e verificar corretude. printEPS com 7 milhoes de pontos geraria
+gigabytes de saida e atrapalharia completamente o benchmark.
+
+
+================================================================================
+SECAO 2 — kmeans_seq.c -> kmeans_openmp_cpu.c (OpenMP para CPU)
+================================================================================
+
+MODIFICACAO 4 — Inclusao do header OpenMP
+------------------------------------------
+    #include <omp.h>
+
+Necessario para usar todas as diretivas #pragma omp e funcoes como
+omp_get_wtime() e omp_set_num_threads(). Sem ele o compilador nao reconhece
+as diretivas (trata como comentario) e as funcoes nao existem.
+
+
+MODIFICACAO 5 — Paralelizacao do Step 2 (acumulacao dos centróides)
+--------------------------------------------------------------------
+SEQUENCIAL:
+
+    for (size_t j = 0; j < size; j++) {
+        t = observations[j].group;
+        clusters[t].x += observations[j].x;  // RACE CONDITION se paralelo
+        clusters[t].y += observations[j].y;
+        clusters[t].count++;
+    }
+
+OPENMP CPU:
+
+    #pragma omp parallel
+    {
+        cluster *localClusters = (cluster *)calloc(k, sizeof(cluster));
+
+        #pragma omp for
+        for (size_t j = 0; j < size; j++) {
+            int group = observations[j].group;
+            localClusters[group].x += observations[j].x;
+            localClusters[group].y += observations[j].y;
+            localClusters[group].count++;
+        }
+
+        #pragma omp critical
+        {
+            for (int i = 0; i < k; i++) {
+                clusters[i].x += localClusters[i].x;
+                clusters[i].y += localClusters[i].y;
+                clusters[i].count += localClusters[i].count;
+            }
+        }
+        free(localClusters);
+    }
+
+POR QUE: o loop original tem race condition, multiplas threads atualizando
+clusters[t] ao mesmo tempo corromperia os dados (duas threads leem o mesmo
+valor, somam valores diferentes e escrevem resultados errados). A solucao e
+cada thread ter seu proprio vetor local localClusters, acumular sem conflito, e
+depois combinar com #pragma omp critical (que garante que so uma thread por vez
+faz a soma global). Isso e mais eficiente que usar atomic para doubles porque
+reduz o numero de operacoes atomicas de N (7M) para apenas k*nthreads (11*32).
+
+
+MODIFICACAO 6 — Paralelizacao do Step 3+4 (reatribuicao dos pontos)
+--------------------------------------------------------------------
+SEQUENCIAL:
+
+    changed = 0;
+    for (size_t j = 0; j < size; j++) {
+        t = calculateNearst(observations + j, clusters, k);
+        if (t != observations[j].group) {
+            changed++;
+            observations[j].group = t;
+        }
+    }
+
+OPENMP CPU:
+
+    #pragma omp parallel for reduction(+:changed)
+    for (size_t j = 0; j < size; j++) {
+        int nearest = calculateNearst(observations + j, clusters, k);
+        if (nearest != observations[j].group) {
+            changed++;
+            observations[j].group = nearest;
+        }
+    }
+
+POR QUE: este e o loop mais pesado, 7 milhoes de chamadas a calculateNearst
+por iteracao. Cada iteracao e completamente independente (ponto j nao depende
+do ponto j+1), portanto e trivialmente paralelizavel. O reduction(+:changed)
+resolve a race condition na variavel changed: cada thread tem sua copia local
+e ao final o OpenMP soma todas automaticamente, sem necessidade de critical ou
+atomic explicitoS.
+
+
+MODIFICACAO 7 — Controle de threads e medicao com omp_get_wtime
+----------------------------------------------------------------
+    int nthreads = (argc > 2) ? atoi(argv[2]) : omp_get_max_threads();
+    omp_set_num_threads(nthreads);
+    double t_start = omp_get_wtime();
+
+POR QUE: permite testar 1, 2, 4, 8, 16, 32 threads passando como argumento
+sem recompilar o codigo. omp_get_wtime() e a funcao padrao OpenMP para wall
+time — mais portavel que clock_gettime em contexto paralelo e ja disponivel
+quando omp.h e incluido.
+
+
+================================================================================
+SECAO 3 — kmeans_openmp_cpu.c -> kmeans_openmp_gpu.c (OpenMP para GPU)
+================================================================================
+
+MODIFICACAO 8 — Conversao para SoA (Structure of Arrays)
+---------------------------------------------------------
+CPU: usava observations[] diretamente (Array of Structs — AoS).
+    struct { double x; double y; int group; } observations[N];
+
+GPU:
+    double *ox   = malloc(size * sizeof(double));
+    double *oy   = malloc(size * sizeof(double));
+    int    *ogrp = malloc(size * sizeof(int));
+
+POR QUE: GPUs acessam memoria de forma coalescente — threads adjacentes devem
+acessar enderecos adjacentes para maximizar a largura de banda. Em um Array of
+Structs {x, y, group}, threads lendo x[0], x[1], x[2]... saltam 3 campos por
+acesso (stride 3), o que desperdiça largura de banda. Em arrays separados
+ox[0], ox[1], ox[2]... os acessos sao sequenciais e coalescentes, usando toda
+a largura de banda disponivel da memoria da GPU.
+
+
+MODIFICACAO 9 — #pragma omp declare target
+------------------------------------------
+    #pragma omp declare target
+    int calculateNearst(double ox, double oy, double *cx, double *cy, int k)
+    { ... }
+    #pragma omp end declare target
+
+POR QUE: funcoes chamadas dentro de regioes target precisam existir no device
+(GPU). Sem essa diretiva, o compilador nao geraria codigo para a GPU e daria
+erro de linking ao tentar chamar calculateNearst de dentro de um kernel. A
+assinatura tambem mudou — recebe double ox, oy em vez de observation* porque
+structs nao mapeiam facilmente para GPU e porque os dados ja estao em arrays
+separados (SoA).
+
+
+MODIFICACAO 10 — #pragma omp target data
+-----------------------------------------
+    #pragma omp target data
+        map(to:     ox[0:size], oy[0:size])
+        map(tofrom: ogrp[0:size])
+        map(alloc:  cx[0:k], cy[0:k], ccount[0:k])
+    {
+        do { ... } while (changed > minAcceptedError);
+    }
+
+POR QUE: sem isso, cada #pragma omp target dentro do loop copiaria os arrays
+para a GPU e de volta a cada iteracao — transferencia de ~80MB por iteracao,
+o que seria catastroficamente lento (barramento PCIe tem ~16 GB/s, cada copia
+levaria ~5ms, e com dezenas de iteracoes o overhead dominaria o tempo total).
+Com target data, os dados ficam na GPU durante todo o loop. Os tipos de mapa
+sao: map(to:) = copia para GPU apenas; map(tofrom:) = copia para GPU e de
+volta ao final; map(alloc:) = apenas aloca espaco, sem copiar (inicializado
+pelos proprios kernels).
+
+
+MODIFICACAO 11 — Kernels no device com target teams distribute parallel for
+---------------------------------------------------------------------------
+    #pragma omp target teams distribute parallel for
+    for (int j = 0; j < n; j++) { ... }
+
+POR QUE: cada palavra da diretiva tem funcao especifica:
+  - target:     executa no device (GPU) em vez da CPU
+  - teams:      cria multiplos grupos de threads (equivalente a blocos CUDA)
+  - distribute: distribui as iteracoes entre os grupos criados por teams
+  - parallel for: paraleliza as iteracoes dentro de cada grupo
+
+A combinacao completa e necessaria para explorar os dois niveis de paralelismo
+da GPU: entre grupos (multiprocessadores) e dentro de cada grupo (threads SIMD).
+Usar apenas target parallel for sem teams nao criaria grupos suficientes para
+utilizar todos os multiprocessadores da GPU.
+
+
+MODIFICACAO 12 — Atomic update no device e reducao de changed
+-------------------------------------------------------------
+    #pragma omp atomic update
+    cx[g] += ox[j];
+
+    #pragma omp target teams distribute parallel for
+        map(tofrom: changed) reduction(+:changed)
+    for (int j = 0; j < n; j++) { ... }
+
+POR QUE: as mesmas races conditions do codigo sequencial existem no device.
+atomic update garante que a soma em cx[g] seja atomica na GPU. Para changed,
+a reduction e preferida ao atomic porque e implementada de forma mais eficiente
+pelo compilador (arvore de reducao em shared memory) do que multiplos atomics
+concorrentes. O map(tofrom: changed) garante que o resultado seja copiado de
+volta ao host para checar a condicao do do-while.
+
+
+================================================================================
+SECAO 4 — kmeans_seq.c -> kmeans_cuda.cu (CUDA para GPU NVIDIA)
+================================================================================
+
+MODIFICACAO 13 — Divisao em 4 kernels CUDA separados
+-----------------------------------------------------
+A logica do loop principal foi dividida em 4 funcoes __global__:
+
+  resetCentroids       — 1 thread por cluster — zera cx, cy, ccount na GPU
+  accumulateCentroids  — 1 thread por ponto   — soma coordenadas ao centroide
+  normalizeCentroids   — 1 thread por cluster — divide pelo count
+  assignPoints         — 1 thread por ponto   — encontra vizinho mais proximo
+
+POR QUE: CUDA nao tem sincronizacao global entre threads de kernels diferentes
+dentro do mesmo grid. Separar em kernels distintos garante que todos os threads
+terminaram a etapa anterior antes de comecar a proxima (kernels no mesmo stream
+executam em ordem sequencial). Tentar fazer tudo em um unico kernel exigiria
+__syncthreads() que so sincroniza dentro do mesmo bloco, nao entre blocos.
+
+Lancamento dos kernels:
+    resetCentroids<<<blocks_k, BLOCK_SIZE>>>(...);
+    accumulateCentroids<<<blocks_n, BLOCK_SIZE, smem_size>>>(...);
+    normalizeCentroids<<<blocks_k, BLOCK_SIZE>>>(...);
+    assignPoints<<<blocks_n, BLOCK_SIZE>>>(...);
+
+blocks_n = (n + BLOCK_SIZE - 1) / BLOCK_SIZE  // um bloco para cada 256 pontos
+blocks_k = (k + BLOCK_SIZE - 1) / BLOCK_SIZE  // um bloco para os k clusters
+
+
+MODIFICACAO 14 — atomicCAS para implementar atomicAdd em double
+---------------------------------------------------------------
+    __device__ double atomicAddDouble(double *address, double val) {
+        unsigned long long int *addr_as_ull = (unsigned long long int *)address;
+        unsigned long long int old = *addr_as_ull, assumed;
+        do {
+            assumed = old;
+            old = atomicCAS(addr_as_ull, assumed,
+                    __double_as_longlong(val + __longlong_as_double(assumed)));
+        } while (assumed != old);
+        return __longlong_as_double(old);
+    }
+
+POR QUE: atomicAdd(double*) so existe nativamente a partir de compute
+capability 6.0. Para garantir compatibilidade com qualquer GPU, implementamos
+via atomicCAS (compare-and-swap atomico). O funcionamento e:
+  1. Le o valor atual do endereco
+  2. Calcula o novo valor (atual + val)
+  3. Tenta substituir atomicamente — se outro thread modificou enquanto isso,
+     o CAS falha e o loop repete com o valor atualizado
+  4. Quando bem-sucedido, retorna o valor antigo
+
+__double_as_longlong e __longlong_as_double sao intrinsics CUDA que reinterpretam
+os bytes do double como unsigned long long (necessario porque atomicCAS opera
+em inteiros, nao em ponto flutuante).
+
+
+MODIFICACAO 15 — Shared memory no accumulateCentroids
+------------------------------------------------------
+VERSAO INGENUA (lenta):
+
+    // 7M threads tentando atomicAdd nos mesmos 11 enderecos globais
+    atomicAddDouble(&cx[g], ox[j]);  // ~900K threads por endereco
+
+COM SHARED MEMORY:
+
+    extern __shared__ char smem[];
+    double *s_cx    = (double *)smem;        // local ao bloco, rapido
+    double *s_cy    = s_cx + k;
+    int    *s_count = (int *)(s_cy + k);
+
+    // inicializa shared memory do bloco
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_cx[i] = 0.0; s_cy[i] = 0.0; s_count[i] = 0;
+    }
+    __syncthreads();
+
+    // cada thread acumula em shared memory (atomic local ao bloco)
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n) {
+        int g = ogrp[j];
+        atomicAddDouble(&s_cx[g], ox[j]);   // ~256 threads concorrentes max
+        atomicAddDouble(&s_cy[g], oy[j]);
+        atomicAdd(&s_count[g], 1);
+    }
+    __syncthreads();
+
+    // reduz resultado do bloco no vetor global (apenas k atomics por bloco)
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        if (s_count[i] > 0) {
+            atomicAddDouble(&cx[i], s_cx[i]);
+            atomicAddDouble(&cy[i], s_cy[i]);
+            atomicAdd(&ccount[i], s_count[i]);
+        }
+    }
+
+POR QUE: este e o otimizacao mais importante do codigo CUDA. Com 7 milhoes
+de threads e apenas 11 clusters, cada endereco global recebia ~900 mil acessos
+atomicos simultaneos, criando uma fila serializada que anulava completamente o
+paralelismo da GPU. Com shared memory:
+  - Cada bloco de 256 threads acumula nos 11 enderecos de shared memory
+    (maxima contencao: 256 threads por endereco)
+  - Shared memory fica dentro do chip do multiprocessador (~5 ciclos de latencia
+    vs ~600 ciclos da memoria global)
+  - Ao final, cada bloco faz apenas k=11 atomics globais
+  - Total de atomics globais: 39.062 (7M / 256)
+
+O __syncthreads() e obrigatorio antes de ler shared memory escrita por outras
+threads do mesmo bloco, e antes de escrever no global com dados da shared.
+
+
+MODIFICACAO 16 — Gerenciamento de memoria no device
+----------------------------------------------------
+    // Aloca uma unica vez fora do loop
+    cudaMalloc(&d_ox,      n * sizeof(double));
+    cudaMalloc(&d_oy,      n * sizeof(double));
+    // ...
+
+    // Copia dados para GPU uma unica vez
+    cudaMemcpy(d_ox, h_ox, n * sizeof(double), cudaMemcpyHostToDevice);
+
+    // Loop de convergencia — sem transferencias
+    do {
+        resetCentroids<<<...>>>();
+        accumulateCentroids<<<...>>>();
+        normalizeCentroids<<<...>>>();
+        assignPoints<<<...>>>();
+        cudaMemcpy(&changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+    } while (changed > minAcceptedError);
+
+    // Copia resultado final de volta
+    cudaMemcpy(h_ogrp, d_ogrp, n * sizeof(int), cudaMemcpyDeviceToHost);
+
+POR QUE: transferencias PCIe CPU<->GPU sao caras (~16 GB/s vs ~900 GB/s da
+memoria da GPU). Transferir 7M pontos (80MB de doubles) a cada iteracao do
+loop destruiria o desempenho. A unica transferencia necessaria por iteracao e
+o inteiro changed (4 bytes) para checar convergencia no host.
+
+
+MODIFICACAO 17 — cudaEvent para medicao de tempo precisa na GPU
+---------------------------------------------------------------
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventRecord(start);
+    cluster *clusters = kMeans(observations, size, k);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);  // bloqueia ate GPU terminar
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("Tempo: %.4f s\n", ms / 1000.0f);
+
+POR QUE: kernels CUDA sao assincronos em relacao ao host — quando a CPU chama
+um kernel, ela continua executando sem esperar a GPU terminar. Se usassemos
+clock() ou omp_get_wtime(), mediria apenas o tempo de lancamento dos kernels
+(microsegundos), nao a execucao real na GPU. cudaEventSynchronize bloqueia o
+host ate todos os kernels anteriores concluirem, garantindo medicao correta.
+cudaEventElapsedTime retorna o tempo medido pelo hardware da GPU, que e mais
+preciso que medicoes do lado do host.
+
+
+================================================================================
+RESUMO GERAL DAS DECISOES DE DESIGN
+================================================================================
+
+  Problema                          | Solucao adotada
+  ----------------------------------|--------------------------------------------
+  Dataset de teste insuficiente     | NYC Taxi CSV com ~10M pontos reais
+  Race condition na acumulacao CPU  | Local clusters por thread + critical
+  Race condition em changed         | reduction(+:changed)
+  Transferencia repetida CPU<->GPU  | target data / cudaMalloc fora do loop
+  Structs ineficientes na GPU       | Conversao para SoA (arrays separados)
+  Funcao indisponivel no device     | #pragma omp declare target
+  atomicAdd(double) incompativel    | Implementacao via atomicCAS
+  Contencao em atomics globais GPU  | Shared memory por bloco
+  Medicao imprecisa na GPU          | cudaEventSynchronize
+  Reproducibilidade entre versoes   | srand(42) em todas as versoes
+
+================================================================================
