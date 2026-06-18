@@ -1,4 +1,5 @@
 Luiz Fernando Antunes da Silva Frassi
+================================================================================
 Pedro Augusto Gomes
 ================================================================================
   K-MEANS CLUSTERING — PARALELIZACAO COM OpenMP E CUDA
